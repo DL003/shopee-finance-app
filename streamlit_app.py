@@ -4,83 +4,94 @@ import io
 
 st.set_page_config(page_title="Shopee 财务核算工具", layout="wide")
 
-st.title("📊 Shopee 财务账单自动核算")
-st.markdown("---")
+st.title("📊 Shopee 财务账单自动核算 (优化版)")
 
-# 侧边栏：操作说明
-with st.sidebar:
-    st.header("使用说明")
-    st.write("1. 依次上传三个 Excel 文件")
-    st.write("2. 点击开始处理按钮")
-    st.write("3. 预览结果并下载 Excel")
-    st.info("提示：系统会自动根据 'order number' 进行多表匹配，并根据订单状态处理数据。")
+# --- 辅助函数：模糊匹配列名 ---
+def find_col(df, keyword):
+    """在列名中寻找包含关键字的列名"""
+    for col in df.columns:
+        if keyword.lower() in str(col).lower():
+            return col
+    return None
 
-# 1. 文件上传
+# 文件上传
 col1, col2, col3 = st.columns(3)
 with col1:
-    f_sales = st.file_uploader("上传【销售订单表】", type=['xlsx'])
+    f_sales = st.file_uploader("1. 销售订单表", type=['xlsx'])
 with col2:
-    f_income = st.file_uploader("上传【订单收入报表】", type=['xlsx'])
+    f_income = st.file_uploader("2. 订单收入报表", type=['xlsx'])
 with col3:
-    f_cost = st.file_uploader("上传【本地成本表】", type=['xlsx'])
+    f_cost = st.file_uploader("3. 成本表", type=['xlsx'])
 
-# 2. 核心处理逻辑
 if f_sales and f_income and f_cost:
     if st.button("🚀 开始自动化对账"):
         try:
-            # 读取数据
             df_s = pd.read_excel(f_sales)
             df_i = pd.read_excel(f_income)
             df_c = pd.read_excel(f_cost)
 
-            # 计算订单行计数（用于平摊优惠券）
+            # 清理列名空格
+            df_s.columns = df_s.columns.str.strip()
+            df_i.columns = df_i.columns.str.strip()
+            df_c.columns = df_c.columns.str.strip()
+
+            # 动态寻找收入表中的费用列
+            # 我们通过关键字匹配，防止因为比例变化（如7.2%变8%）导致报错
+            col_order = find_col(df_i, "order number")
+            col_ams = find_col(df_i, "AMS Commission")
+            col_comm = find_col(df_i, "Commission fee")
+            col_serv = find_col(df_i, "Service Fee")
+            col_proc = find_col(df_i, "Processing Fee")
+            col_prem = find_col(df_i, "Premium")
+
+            if not col_order:
+                st.error("❌ 在收入报表中没找到 'order number' 列，请检查文件。")
+                st.stop()
+
+            # 提取并重命名，方便计算
+            df_i_clean = df_i[[col_order]].copy()
+            df_i_clean['fee_total'] = 0
+            
+            for c in [col_ams, col_comm, col_serv, col_proc, col_prem]:
+                if c:
+                    df_i_clean['fee_total'] += df_i[c].fillna(0)
+
+            # 匹配逻辑
             df_s['计数'] = df_s.groupby('order number')['order number'].transform('count')
+            df_m = pd.merge(df_s, df_i_clean.drop_duplicates(col_order), 
+                            left_on='order number', right_on=col_order, how='left')
+            
+            # 成本匹配
+            # 这里也用了模糊匹配，防止“成本单价”写错
+            cost_sku_col = find_col(df_c, "Nomor Referensi SKU")
+            cost_price_col = find_col(df_c, "成本") 
+            
+            if cost_sku_col and cost_price_col:
+                df_m = pd.merge(df_m, df_c[[cost_sku_col, cost_price_col]], 
+                                left_on='Nomor Referensi SKU', right_on=cost_sku_col, how='left')
+            else:
+                st.warning("⚠️ 成本表匹配失败：请检查列名是否包含 'Nomor Referensi SKU' 和 '成本'")
 
-            # 匹配收入表字段
-            income_fields = ['order number', 'AMS Commission Fee', 'Commission fee (including PPN 10%)(7.2%)', 
-                             'Service Fee(6.5%)', 'Seller Order Processing Fee(1250)', 'Premium(0.45%)']
-            df_i_sub = df_i[income_fields].drop_duplicates('order number')
-            df_m = pd.merge(df_s, df_i_sub, on='order number', how='left')
-
-            # 匹配成本表 (关联 SKU 并匹配成本单价)
-            # 注意：请确保成本表包含 'Nomor Referensi SKU' 和 '成本单价' 两列
-            df_m = pd.merge(df_m, df_c[['Nomor Referensi SKU', '成本单价']], on='Nomor Referensi SKU', how='left')
-
-            # 财务公式计算函数
-            def calculate_row(row):
-                if row['Status Pesanan'] == 'Batal': # 匹配印尼语取消状态
+            # 计算
+            def run_calc(row):
+                if row['Status Pesanan'] == 'Batal':
                     return 0, 0, 0, 0
-                
-                # 成功订单销售金额
-                s_amt = row['Harga Setelah Diskon'] * row['Jumlah']
-                # 优惠券分摊
-                coupon = row['Voucher Ditanggung Penjual'] / row['计数'] if row['计数'] > 0 else 0
-                # 平台费用汇总
-                fees = sum([row.get(c, 0) for c in income_fields if c != 'order number'])
-                # 最终收入
-                inc = s_amt - coupon + fees
-                # 成本计算
-                c_total = row['成本单价'] * row['Jumlah'] if pd.notnull(row['成本单价']) else 0
-                return s_amt, coupon, inc, c_total
+                s_amt = row.get('Harga Setelah Diskon', 0) * row.get('Jumlah', 0)
+                v_share = row.get('Voucher Ditanggung Penjual', 0) / row['计数'] if row['计数'] > 0 else 0
+                # 最终收入 = 销售额 - 优惠券分摊 + 平台费总和
+                final_inc = s_amt - v_share + row.get('fee_total', 0)
+                c_total = row.get(cost_price_col, 0) * row.get('Jumlah', 0) if pd.notnull(row.get(cost_price_col)) else 0
+                return s_amt, v_share, final_inc, c_total
 
-            # 执行计算
-            df_m[['成功订单销售金额', '优惠券', 'income', '成本']] = df_m.apply(lambda x: pd.Series(calculate_row(x)), axis=1)
-            df_m['ad'] = "" # 预留广告费空列
+            df_m[['成功订单销售金额', '优惠券', 'income', '成本']] = df_m.apply(lambda x: pd.Series(run_calc(x)), axis=1)
+            df_m['ad'] = ""
 
-            st.success("✅ 对账计算完成！")
-            st.dataframe(df_m.head(10)) # 预览前10行
+            st.success("✅ 匹配计算成功！")
+            st.dataframe(df_m.head(10))
 
-            # 3. 导出 Excel
             output = io.BytesIO()
             df_m.to_excel(output, index=False)
-            st.download_button(
-                label="📥 下载对账结果 Excel",
-                data=output.getvalue(),
-                file_name="Shopee_Final_Report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            st.download_button("📥 下载结果 Excel", output.getvalue(), "Result_Optimized.xlsx")
 
         except Exception as e:
-            st.error(f"处理失败，可能原因：Excel 表头不一致。具体错误: {e}")
-
-# 提交并保存文件
+            st.error(f"发生错误: {e}")
