@@ -2,96 +2,80 @@ import streamlit as st
 import pandas as pd
 import io
 
-st.set_page_config(page_title="Shopee 财务核算工具", layout="wide")
+st.set_page_config(page_title="Shopee 财务四表合一", layout="wide")
+st.title("📂 Shopee 财务账单自动化助手 (底表A生成模式)")
 
-st.title("📊 Shopee 财务账单自动核算 (优化版)")
-
-# --- 辅助函数：模糊匹配列名 ---
+# --- 核心辅助：智能寻找列名 ---
 def find_col(df, keyword):
-    """在列名中寻找包含关键字的列名"""
+    """在列名中智能寻找包含关键字的列"""
     for col in df.columns:
         if keyword.lower() in str(col).lower():
             return col
     return None
 
-# 文件上传
-col1, col2, col3 = st.columns(3)
+# 1. 文件上传区
+col1, col2 = st.columns(2)
 with col1:
-    f_sales = st.file_uploader("1. 销售订单表", type=['xlsx'])
+    f_b = st.file_uploader("1. 上传【表B：销售订单表】", type=['xlsx'])
+    f_c = st.file_uploader("2. 上传【表C：订单收入报表】", type=['xlsx'])
 with col2:
-    f_income = st.file_uploader("2. 订单收入报表", type=['xlsx'])
-with col3:
-    f_cost = st.file_uploader("3. 成本表", type=['xlsx'])
+    f_d = st.file_uploader("3. 上传【表D：成本表】", type=['xlsx'])
 
-if f_sales and f_income and f_cost:
-    if st.button("🚀 开始自动化对账"):
+if f_b and f_c and f_d:
+    if st.button("🚀 开始按照表A逻辑生成汇总"):
         try:
-            df_s = pd.read_excel(f_sales)
-            df_i = pd.read_excel(f_income)
-            df_c = pd.read_excel(f_cost)
+            df_b = pd.read_excel(f_b)
+            df_i = pd.read_excel(f_c) # 收入表
+            df_cost = pd.read_excel(f_d) # 成本表
 
-            # 清理列名空格
-            df_s.columns = df_s.columns.str.strip()
-            df_i.columns = df_i.columns.str.strip()
-            df_c.columns = df_c.columns.str.strip()
+            # 步骤 1: 提取表 B 原始字段
+            b_target = ['order number', 'Status Pesanan', 'Alasan Pembatalan', 'No. Resi', 
+                        'Nomor Referensi SKU', 'Harga Setelah Diskon', 'Jumlah', 
+                        'Returned quantity', 'Diskon Dari Shopee', 'Voucher Ditanggung Penjual']
+            df_a = df_b[[c for c in b_target if c in df_b.columns]].copy()
 
-            # 动态寻找收入表中的费用列
-            # 我们通过关键字匹配，防止因为比例变化（如7.2%变8%）导致报错
-            col_order = find_col(df_i, "order number")
-            col_ams = find_col(df_i, "AMS Commission")
-            col_comm = find_col(df_i, "Commission fee")
-            col_serv = find_col(df_i, "Service Fee")
-            col_proc = find_col(df_i, "Processing Fee")
-            col_prem = find_col(df_i, "Premium")
+            # 步骤 2: 计算计数
+            df_a['计数'] = df_a.groupby('order number')['order number'].transform('count')
 
-            if not col_order:
-                st.error("❌ 在收入报表中没找到 'order number' 列，请检查文件。")
-                st.stop()
-
-            # 提取并重命名，方便计算
-            df_i_clean = df_i[[col_order]].copy()
+            # 步骤 3: 匹配表 C 费用 (模糊匹配关键字)
+            df_i_clean = df_i[['order number']].copy()
             df_i_clean['fee_total'] = 0
+            fee_keys = ['AMS Commission', 'Commission fee', 'Service Fee', 'Processing Fee', 'Premium']
+            for k in fee_keys:
+                found = find_col(df_i, k)
+                if found:
+                    df_i_clean['fee_total'] += df_i[found].fillna(0)
             
-            for c in [col_ams, col_comm, col_serv, col_proc, col_prem]:
-                if c:
-                    df_i_clean['fee_total'] += df_i[c].fillna(0)
+            df_a = pd.merge(df_a, df_i_clean.drop_duplicates('order number'), on='order number', how='left')
 
-            # 匹配逻辑
-            df_s['计数'] = df_s.groupby('order number')['order number'].transform('count')
-            df_m = pd.merge(df_s, df_i_clean.drop_duplicates(col_order), 
-                            left_on='order number', right_on=col_order, how='left')
-            
-            # 成本匹配
-            # 这里也用了模糊匹配，防止“成本单价”写错
-            cost_sku_col = find_col(df_c, "Nomor Referensi SKU")
-            cost_price_col = find_col(df_c, "成本") 
-            
-            if cost_sku_col and cost_price_col:
-                df_m = pd.merge(df_m, df_c[[cost_sku_col, cost_price_col]], 
-                                left_on='Nomor Referensi SKU', right_on=cost_sku_col, how='left')
+            # 步骤 4: 匹配表 D 成本
+            sku_col = find_col(df_cost, "Nomor Referensi SKU")
+            cost_col = find_col(df_cost, "成本")
+            if sku_col and cost_col:
+                df_a = pd.merge(df_a, df_cost[[sku_col, cost_col]], left_on='Nomor Referensi SKU', right_on=sku_col, how='left')
             else:
-                st.warning("⚠️ 成本表匹配失败：请检查列名是否包含 'Nomor Referensi SKU' 和 '成本'")
+                st.warning("⚠️ 成本表未找到匹配列，请确保包含 'Nomor Referensi SKU' 和 '成本'。")
 
-            # 计算
+            # 步骤 5: 核心财务计算
+            df_a = df_a.fillna(0)
             def run_calc(row):
-                if row['Status Pesanan'] == 'Batal':
+                if str(row.get('Status Pesanan', '')).strip() == 'Batal':
                     return 0, 0, 0, 0
                 s_amt = row.get('Harga Setelah Diskon', 0) * row.get('Jumlah', 0)
                 v_share = row.get('Voucher Ditanggung Penjual', 0) / row['计数'] if row['计数'] > 0 else 0
-                # 最终收入 = 销售额 - 优惠券分摊 + 平台费总和
                 final_inc = s_amt - v_share + row.get('fee_total', 0)
-                c_total = row.get(cost_price_col, 0) * row.get('Jumlah', 0) if pd.notnull(row.get(cost_price_col)) else 0
-                return s_amt, v_share, final_inc, c_total
+                total_cost = row.get(cost_col, 0) * row.get('Jumlah', 0)
+                return s_amt, v_share, final_inc, total_cost
 
-            df_m[['成功订单销售金额', '优惠券', 'income', '成本']] = df_m.apply(lambda x: pd.Series(run_calc(x)), axis=1)
-            df_m['ad'] = ""
+            df_a[['成功订单销售金额', '优惠券', 'income', '最终成本']] = df_a.apply(lambda x: pd.Series(run_calc(x)), axis=1)
+            df_a['ad'] = ""
 
-            st.success("✅ 匹配计算成功！")
-            st.dataframe(df_m.head(10))
+            st.success("✅ 数据核算完成！")
+            st.dataframe(df_a.head(20))
 
             output = io.BytesIO()
-            df_m.to_excel(output, index=False)
-            st.download_button("📥 下载结果 Excel", output.getvalue(), "Result_Optimized.xlsx")
+            df_a.to_excel(output, index=False)
+            st.download_button("📥 下载汇总结果 Excel", output.getvalue(), "Shopee_Accounting_Final.xlsx")
 
         except Exception as e:
-            st.error(f"发生错误: {e}")
+            st.error(f"处理报错: {e}")
