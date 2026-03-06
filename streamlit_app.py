@@ -2,145 +2,158 @@ import streamlit as st
 import pandas as pd
 import io
 
-st.set_page_config(page_title="Shopee 财务对账助手", layout="wide")
-st.title("🚀 Shopee 财务账单自动化核算 (逻辑重构版)")
+st.set_page_config(page_title="Shopee 财务核算助手", layout="wide")
+st.title("🛍️ Shopee 账单自动化核算 (基于真实表格适配版)")
 
-def get_col(df, keywords):
-    """精准定位列名：去除空格、转小写后包含关键字即可"""
+# 智能匹配函数：忽略大小写和空格
+def get_col_exact(df, target_name):
+    target_clean = str(target_name).strip().lower()
     for col in df.columns:
-        c_clean = str(col).strip().lower()
-        for k in keywords:
-            if k.lower() in c_clean:
-                return col
+        if str(col).strip().lower() == target_clean:
+            return col
+    # 如果没找到完全一样的，尝试模糊匹配
+    for col in df.columns:
+        if target_clean in str(col).strip().lower():
+            return col
     return None
 
-# 文件上传区
+# 文件上传
 col1, col2 = st.columns(2)
 with col1:
-    f_a = st.file_uploader("1. 上传【表A：底表模板】", type=['xlsx'])
-    f_b = st.file_uploader("2. 上传【表B：销售订单表】", type=['xlsx'])
+    f_a = st.file_uploader("1. 上传【模板表.xlsx】", type=['xlsx', 'csv'])
+    f_b = st.file_uploader("2. 上传【订单表.xlsx】", type=['xlsx', 'csv'])
 with col2:
-    f_c = st.file_uploader("3. 上传【表C：订单收入报表】", type=['xlsx'])
-    f_d = st.file_uploader("4. 上传【表D：成本表】", type=['xlsx'])
+    f_c = st.file_uploader("3. 上传【订单收入.xlsx】", type=['xlsx', 'csv'])
+    f_d = st.file_uploader("4. 上传【成本表.xlsx】", type=['xlsx', 'csv'])
 
 if f_a and f_b and f_c and f_d:
     if st.button("🚀 开始自动化对账"):
         try:
-            # 1. 加载数据
-            df_a = pd.read_excel(f_a)
-            df_b = pd.read_excel(f_b)
-            df_c = pd.read_excel(f_c)
-            df_d = pd.read_excel(f_d)
+            # 读取数据 (增加容错，处理CSV或Excel)
+            def load_df(file):
+                try:
+                    return pd.read_excel(file)
+                except:
+                    return pd.read_csv(file)
 
-            # 2. 识别订单号
-            oid_b = get_col(df_b, ['order number', '订单号'])
-            oid_c = get_col(df_c, ['order number', '订单号'])
-            
-            if not oid_b or not oid_c:
-                st.error("❌ 无法识别订单号列，请检查表B和表C。")
+            df_temp = load_df(f_a)
+            df_order = load_df(f_b)
+            df_income = load_df(f_c)
+            df_cost = load_df(f_d)
+
+            # 1. 寻找核心关联键
+            oid_order = get_col_exact(df_order, 'order number')
+            oid_income = get_col_exact(df_income, 'Order number')
+            sku_order = get_col_exact(df_order, 'Nomor Referensi SKU')
+            sku_cost = get_col_exact(df_cost, 'Nomor Referensi SKU')
+            cost_val = get_col_exact(df_cost, '成本单价')
+
+            if not oid_order or not oid_income:
+                st.error("❌ 无法匹配订单号列，请检查订单表和收入表的表头。")
                 st.stop()
 
-            # 3. 提取表C费用逻辑 (强制转数值，避免空值报错)
-            fee_map = {
-                'ams': ['AMS Commission Fee'],
-                'comm': ['Commission fee'],
-                'service': ['Service Fee'],
-                'proc': ['Processing Fee', 'Seller Order Processing'],
-                'premium': ['Premium']
+            # 2. 预处理收入表 (提取5项费用)
+            # 这里的关键字完全对应你上传的 "订单收入.xlsx"
+            income_fee_map = {
+                'ams': 'AMS Commission Fee',
+                'comm': 'Commission fee (including PPN 10%)',
+                'service': 'Service Fee',
+                'proc': 'Seller Order Processing Fee',
+                'premium': 'Premium'
             }
             
-            # 创建干净的收入明细表
-            df_c_clean = df_c[[oid_c]].copy()
-            found_fee_internal_names = []
-            
-            for key, keywords in fee_map.items():
-                actual_col = get_col(df_c, keywords)
+            df_income_clean = df_income[[oid_income]].copy()
+            for key, target in income_fee_map.items():
+                actual_col = get_col_exact(df_income, target)
                 if actual_col:
-                    df_c_clean[key] = pd.to_numeric(df_c[actual_col], errors='coerce').fillna(0)
-                    found_fee_internal_names.append(key)
+                    df_income_clean[key] = pd.to_numeric(df_income[actual_col], errors='coerce').fillna(0)
                 else:
-                    df_c_clean[key] = 0.0
+                    df_income_clean[key] = 0.0
             
-            # 收入表去重
-            df_c_final = df_c_clean.drop_duplicates(oid_c)
+            df_income_final = df_income_clean.drop_duplicates(oid_income)
 
-            # 4. 准备成本数据
-            sku_b = get_col(df_b, ['Nomor Referensi SKU', 'SKU'])
-            sku_d = get_col(df_d, ['Nomor Referensi SKU', 'SKU'])
-            price_d = get_col(df_d, ['成本', '单价'])
-
-            # 5. 合并数据流
-            df_b['计数'] = df_b.groupby(oid_b)[oid_b].transform('count')
-            df_main = pd.merge(df_b, df_c_final, left_on=oid_b, right_on=oid_c, how='left')
+            # 3. 关联数据
+            # 计算计数
+            df_order['计数'] = df_order.groupby(oid_order)[oid_order].transform('count')
             
-            if sku_b and sku_d and price_d:
-                df_main = pd.merge(df_main, df_d[[sku_d, price_d]], left_on=sku_b, right_on=sku_d, how='left')
+            # 合并收入
+            df_main = pd.merge(df_order, df_income_final, left_on=oid_order, right_on=oid_income, how='left')
+            
+            # 合并成本
+            if sku_order and sku_cost and cost_val:
+                df_main = pd.merge(df_main, df_cost[[sku_cost, cost_val]], left_on=sku_order, right_on=sku_cost, how='left')
+            else:
+                df_main['成本单价'] = 0.0
 
-            # 6. 执行核心财务计算
-            status_col = get_col(df_b, ['Status Pesanan', '订单状态'])
-            sale_price_col = get_col(df_b, ['Harga Setelah Diskon', '折后价'])
-            qty_col = get_col(df_b, ['Jumlah', '数量'])
-            voucher_col = get_col(df_b, ['Voucher Ditanggung Penjual', '优惠券'])
+            # 4. 执行财务公式
+            # 对应订单表.xlsx的原始列名
+            status_col = get_col_exact(df_order, 'Status Pesanan')
+            price_col = get_col_exact(df_order, 'Harga Setelah Diskon')
+            qty_col = get_col_exact(df_order, 'Jumlah')
+            voucher_col = get_col_exact(df_order, 'Voucher Ditanggung Penjual')
 
             df_main = df_main.fillna(0)
 
-            def calc_logic(row):
-                # 状态检查
+            def calc_row(row):
+                # 状态判断
                 st_str = str(row.get(status_col, '')).lower()
-                if any(x in st_str for x in ['batal', 'cancelled', '取消']):
+                if 'batal' in st_str or 'cancel' in st_str:
                     return 0.0, 0.0, 0.0, 0.0
                 
-                # 原始值获取
-                s_price = row.get(sale_price_col, 0)
-                qty = row.get(qty_col, 0)
-                v_total = row.get(voucher_col, 0)
-                cnt = row.get('计数', 1)
-                
-                # 计算中间项
-                sales_amt = s_price * qty
-                v_share = v_total / cnt if cnt > 0 else 0
-                
-                # 费用汇总 (直接从我们定义的 key 中取)
-                fee_sum = row['ams'] + row['comm'] + row['service'] + row['proc'] + row['premium']
-                
-                income = sales_amt - v_share + fee_sum
-                cost = row.get(price_d, 0) * qty
-                
-                return sales_amt, v_share, income, cost
+                # 销售额 = 折后价 * 数量
+                s_amt = row.get(price_col, 0) * row.get(qty_col, 0)
+                # 优惠券平摊
+                v_share = row.get(voucher_col, 0) / row['计数'] if row['计数'] > 0 else 0
+                # 费用汇总
+                fees = row['ams'] + row['comm'] + row['service'] + row['proc'] + row['premium']
+                # Income
+                inc = s_amt - v_share + fees
+                # 单行成本
+                c_total = row.get(cost_val, 0) * row.get(qty_col, 0)
+                return s_amt, v_share, inc, c_total
 
-            df_main[['_S', '_V', '_I', '_C']] = df_main.apply(lambda r: pd.Series(calc_logic(r)), axis=1)
+            df_main[['_S', '_V', '_I', '_C']] = df_main.apply(lambda r: pd.Series(calc_row(r)), axis=1)
 
-            # 7. 映射回表 A 模板
-            df_result = pd.DataFrame(columns=df_a.columns)
+            # 5. 映射回模板 A
+            # 这里的逻辑：只要模板里的列名在 df_main 里能找到，就填进去
+            df_final = pd.DataFrame(columns=df_temp.columns)
             
-            for col in df_result.columns:
+            # 定义一个映射字典，处理特殊计算项
+            special_map = {
+                '成功订单销售金额': '_S',
+                '优惠券': '_V',
+                'income': '_I',
+                '成本': cost_val,
+                '总成本': '_C'
+            }
+
+            for col in df_final.columns:
                 c_name = str(col).strip()
-                # A. 费用明细映射
+                # A. 先查费用明细映射
                 matched_fee = False
-                for key, keywords in fee_map.items():
-                    if keywords[0].lower() in c_name.lower():
-                        df_result[col] = df_main[key]
+                for k_internal, k_orig in income_fee_map.items():
+                    if k_orig.lower() in c_name.lower():
+                        df_final[col] = df_main[k_internal]
                         matched_fee = True
                         break
                 if matched_fee: continue
 
-                # B. 计算结果映射
-                if '成功订单销售金额' in c_name: df_result[col] = df_main['_S']
-                elif 'income' in c_name.lower(): df_result[col] = df_main['_I']
-                elif '最终成本' in c_name or ('成本' in c_name and '单价' not in c_name): df_result[col] = df_main['_C']
-                elif '优惠券' in c_name: df_result[col] = df_main['_V']
+                # B. 查特殊计算结果
+                if c_name in special_map:
+                    df_final[col] = df_main[special_map[c_name]]
                 else:
-                    # C. 原始字段映射
-                    orig = get_col(df_main, [c_name])
-                    if orig: df_result[col] = df_main[orig]
+                    # C. 查原始字段
+                    orig = get_col_exact(df_main, c_name)
+                    if orig:
+                        df_final[col] = df_main[orig]
 
-            st.success("✅ 核算成功！已生成最终结果。")
-            st.dataframe(df_result.head(10))
+            st.success("✅ 对账完成！请预览并下载结果。")
+            st.dataframe(df_final.head(10))
 
             # 导出
             out = io.BytesIO()
-            df_result.to_excel(out, index=False)
-            st.download_button("📥 下载 Shopee 核算结果", out.getvalue(), "Shopee_Final_Report.xlsx")
+            df_final.to_excel(out, index=False)
+            st.download_button("📥 下载 Shopee 核算结果", out.getvalue(), "Shopee_Final_A.xlsx")
 
         except Exception as e:
-            st.error(f"❌ 运行报错: {str(e)}")
+            st.error(f"❌ 逻辑执行报错: {str(e)}")
