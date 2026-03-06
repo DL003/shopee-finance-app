@@ -44,8 +44,7 @@ if f_a and f_b and f_c and f_d:
                 st.error("❌ 无法识别订单号列，请确保销售表和收入表包含 'order number'。")
                 st.stop()
 
-            # --- 1. 定义费用关键字映射 ---
-            # 这些关键字是表C中常见的核心文本，程序会忽略括号里的百分比进行匹配
+            # --- 1. 定义费用关键字映射 (支持模糊提取) ---
             fee_mapping = {
                 'AMS Commission Fee': ['AMS Commission Fee'],
                 'Commission fee': ['Commission fee'],
@@ -54,37 +53,32 @@ if f_a and f_b and f_c and f_d:
                 'Premium': ['Premium']
             }
 
-            # --- 2. 预处理收入表 C (提取费用并去重) ---
+            # --- 2. 预处理收入表 C ---
             df_income_processed = df_income[[income_order_col]].copy()
-            # 记录在表C中实际找到的费用列名
-            matched_fee_cols = {} 
-
             for internal_key, search_keys in fee_mapping.items():
                 real_col = smart_find_col(df_income, search_keys)
                 if real_col:
                     df_income_processed[internal_key] = pd.to_numeric(df_income[real_col], errors='coerce').fillna(0)
-                    matched_fee_cols[internal_key] = internal_key
             
-            # 按订单号去重，确保每个订单只有一行费用汇总
+            # 去重
             df_income_processed = df_income_processed.drop_duplicates(income_order_col)
 
-            # --- 3. 准备成本表 D 数据 ---
+            # --- 3. 准备成本表 D ---
             cost_sku_col = smart_find_col(df_cost, ['Nomor Referensi SKU', 'SKU'])
             cost_val_col = smart_find_col(df_cost, ['成本', '单价'])
             sales_sku_col = smart_find_col(df_sales, ['Nomor Referensi SKU', 'SKU'])
 
             # --- 4. 核心合并与计算 ---
-            # A. 计算表B每订单行数（平摊优惠券用）
             df_sales['计数'] = df_sales.groupby(sales_order_col)[sales_order_col].transform('count')
             
-            # B. 合并收入数据
+            # 合并收入
             df_main = pd.merge(df_sales, df_income_processed, left_on=sales_order_col, right_on=income_order_col, how='left')
             
-            # C. 合并成本数据
+            # 合并成本
             if cost_sku_col and cost_val_col and sales_sku_col:
                 df_main = pd.merge(df_main, df_cost[[cost_sku_col, cost_val_col]], left_on=sales_sku_col, right_on=cost_sku_col, how='left')
             
-            # D. 执行具体财务公式
+            # 财务逻辑
             status_col = smart_find_col(df_sales, ['Status Pesanan', '订单状态'])
             price_col = smart_find_col(df_sales, ['Harga Setelah Diskon', '折后价'])
             qty_col = smart_find_col(df_sales, ['Jumlah', '数量'])
@@ -93,34 +87,24 @@ if f_a and f_b and f_c and f_d:
             df_main = df_main.fillna(0)
             
             def run_calc(row):
-                # 判定取消状态
                 status_str = str(row.get(status_col, '')).lower()
                 if any(x in status_str for x in ['batal', 'cancelled', '取消']):
                     return 0, 0, 0, 0
                 
-                # 计算逻辑
-                success_sales = row.get(price_col, 0) * row.get(qty_col, 0)
-                voucher_share = row.get(voucher_col, 0) / row['计数'] if row['计数'] > 0 else 0
-                
-                # 汇总所有匹配到的费用（计算 income 用）
+                s_sales = row.get(price_col, 0) * row.get(qty_col, 0)
+                v_share = row.get(voucher_col, 0) / row['计数'] if row['计数'] > 0 else 0
                 total_fees = sum([row.get(k, 0) for k in fee_mapping.keys()])
-                
-                final_income = success_sales - voucher_share + total_fees
-                item_cost = row.get(cost_val_col, 0) * row.get(qty_col, 0)
-                
-                return success_sales, voucher_share, final_income, item_cost
+                f_income = s_sales - v_share + total_fees
+                f_cost = row.get(cost_val_col, 0) * row.get(qty_col, 0)
+                return s_sales, v_share, f_income, f_cost
 
-            df_main[['_calc_sales', '_calc_voucher', '_calc_income', '_calc_cost']] = df_main.apply(
-                lambda x: pd.Series(run_calc(x)), axis=1
-            )
+            df_main[['_sales', '_voucher', '_income', '_cost']] = df_main.apply(lambda x: pd.Series(run_calc(x)), axis=1)
 
-            # --- 5. 最终匹配并填充回模板 A ---
+            # --- 5. 填充模板 A ---
             final_df = pd.DataFrame(columns=df_template.columns)
-            
             for col in final_df.columns:
                 col_name = str(col).strip()
-                
-                # 情况 A: 匹配费用明细列 (模糊识别文本)
+                # 模糊匹配费用明细
                 matched_fee = None
                 for k in fee_mapping.keys():
                     if k.lower() in col_name.lower():
@@ -129,24 +113,20 @@ if f_a and f_b and f_c and f_d:
                 
                 if matched_fee:
                     final_df[col] = df_main[matched_fee]
-                # 情况 B: 匹配计算结果列
-                elif '成功订单销售金额' in col_name: final_df[col] = df_main['_calc_sales']
-                elif 'income' in col_name.lower(): final_df[col] = df_main['_calc_income']
-                elif '最终成本' in col_name or ('成本' in col_name and '单价' not in col_name): 
-                    final_df[col] = df_main['_calc_cost']
-                elif '优惠券' in col_name: final_df[col] = df_main['_calc_voucher']
-                # 情况 C: 匹配其他原始列
+                elif '成功订单销售金额' in col_name: final_df[col] = df_main['_sales']
+                elif 'income' in col_name.lower(): final_df[col] = df_main['_income']
+                elif '成本' in col_name and '单价' not in col_name: final_df[col] = df_main['_cost']
+                elif '优惠券' in col_name: final_df[col] = df_main['_voucher']
                 else:
                     orig_match = smart_find_col(df_main, [col_name])
                     if orig_match: final_df[col] = df_main[orig_match]
 
-            st.success("✅ 核算成功！费用列已根据文字关键字自动匹配。")
+            st.success("✅ 核算成功！费用列已根据关键字自动匹配。")
             st.dataframe(final_df.head(10))
 
-            # 导出 Excel
             output = io.BytesIO()
             final_df.to_excel(output, index=False)
-            st.download_button("📥 下载核算结果 (表A)", output.getvalue(), "Shopee_Accounting_Result.xlsx")
+            st.download_button("📥 下载结果 (表A)", output.getvalue(), "Shopee_Accounting_Result.xlsx")
 
         except Exception as e:
-            st.error(f"处理中发生逻辑错误: {e}")
+            st.error(f"处理错误: {e}")
