@@ -4,21 +4,32 @@ import io
 import re
 
 st.set_page_config(page_title="Shopee 财务核算助手", layout="wide")
-st.title("🛍️ Shopee 账单自动化核算 (千位符修复版)")
+st.title("🛍️ Shopee 账单自动化核算 (千分位小数点深度修复版)")
 
-# --- 核心辅助：清洗印尼格式金额 ---
+# --- 核心辅助：清洗印尼/特殊格式金额 ---
 def clean_currency(value):
     """
-    将 '299.000' 或 '299,000' 转换为 299000
+    深度清洗金额：将 '125.795' 还原为 125795.0
+    处理逻辑：
+    1. 移除所有小数点 '.' (印尼千分位)
+    2. 将逗号 ',' 替换为 '.' (处理可能的角分)
+    3. 移除非数字/非负号/非小数点的字符 (如 Rp)
     """
-    if pd.isna(value) or value == "":
+    if pd.isna(value) or str(value).strip() == "" or str(value).strip() == "-":
         return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
     
-    # 移除所有非数字和非负号字符 (保留负号以防费用项)
-    # 但由于千位符是点，我们先移除所有的点和逗号
-    val_str = str(value).replace('.', '').replace(',', '').strip()
+    val_str = str(value).strip()
+    
+    # 特殊处理：如果 Pandas 已经把 215.000 读成了 "215.0"，我们需要通过逻辑判断还原
+    # 但最稳妥的方法是在读取时使用 dtype=str，所以这里假设我们拿到的是原始字符串
+    
+    # 1. 移除千分位点
+    val_str = val_str.replace('.', '')
+    # 2. 处理可能存在的逗号小数点
+    val_str = val_str.replace(',', '.')
+    # 3. 移除非数字字符 (保留负号和处理后的点)
+    val_str = re.sub(r'[^0-9.\-]', '', val_str)
+    
     try:
         return float(val_str)
     except:
@@ -44,11 +55,15 @@ with col2:
     f_d = st.file_uploader("4. 上传【成本表.xlsx】", type=['xlsx', 'csv'])
 
 if f_a and f_b and f_c and f_d:
-    if st.button("🚀 开始修复金额并核算"):
+    if st.button("🚀 开始核算 (已应用千分位修复)"):
         try:
+            # 读取数据：关键点！强制所有列读取为字符串 dtype=str
             def load_df(file):
-                try: return pd.read_excel(file)
-                except: return pd.read_csv(file)
+                try: 
+                    # 尝试读取 Excel，强制所有单元格为字符串以保留原始格式
+                    return pd.read_excel(file, dtype=str)
+                except: 
+                    return pd.read_csv(file, dtype=str)
 
             df_temp = load_df(f_a)
             df_order = load_df(f_b)
@@ -66,7 +81,7 @@ if f_a and f_b and f_c and f_d:
                 st.error("❌ 无法匹配订单号列。")
                 st.stop()
 
-            # 1. 预处理收入表 (清洗金额)
+            # 1. 预处理收入表 (清洗所有金额列)
             income_fee_map = {
                 'ams': 'AMS Commission Fee',
                 'comm': 'Commission fee (including PPN 10%)',
@@ -79,7 +94,6 @@ if f_a and f_b and f_c and f_d:
             for key, target in income_fee_map.items():
                 actual_col = get_col_exact(df_income, target)
                 if actual_col:
-                    # 使用 clean_currency 处理费用列
                     df_income_clean[key] = df_income[actual_col].apply(clean_currency)
                 else:
                     df_income_clean[key] = 0.0
@@ -93,14 +107,13 @@ if f_a and f_b and f_c and f_d:
             
             df_order[price_col] = df_order[price_col].apply(clean_currency)
             df_order[voucher_col] = df_order[voucher_col].apply(clean_currency)
-            # 数量通常是整数，直接转换
             df_order[qty_col] = pd.to_numeric(df_order[qty_col], errors='coerce').fillna(0)
 
             # 3. 关联数据
             df_order['计数'] = df_order.groupby(oid_order)[oid_order].transform('count')
             df_main = pd.merge(df_order, df_income_final, left_on=oid_order, right_on=oid_income, how='left')
             
-            # 关联成本并清洗
+            # 关联并清洗成本
             if sku_order and sku_cost and cost_val_col:
                 df_cost_sub = df_cost[[sku_cost, cost_val_col]].copy()
                 df_cost_sub[cost_val_col] = df_cost_sub[cost_val_col].apply(clean_currency)
@@ -108,7 +121,7 @@ if f_a and f_b and f_c and f_d:
             else:
                 df_main['成本单价'] = 0.0
 
-            # 4. 财务核算
+            # 4. 核心核算逻辑
             status_col = get_col_exact(df_order, 'Status Pesanan')
             
             def calc_row(row):
@@ -120,7 +133,7 @@ if f_a and f_b and f_c and f_d:
                 v_share = row.get(voucher_col, 0) / row['计数'] if row['计数'] > 0 else 0
                 fees = row['ams'] + row['comm'] + row['service'] + row['proc'] + row['premium']
                 
-                # 现在计算出来的 inc 应该是正值了
+                # 计算 income (现在销售额应该是 125795 而不是 125.795)
                 inc = s_amt - v_share + fees
                 c_total = row.get(cost_val_col, 0) * row.get(qty_col, 0)
                 return s_amt, v_share, inc, c_total
@@ -133,7 +146,7 @@ if f_a and f_b and f_c and f_d:
 
             for col in df_final.columns:
                 c_name = str(col).strip()
-                # 费用明细
+                # 费用明细映射
                 matched_fee = False
                 for k_internal, k_orig in income_fee_map.items():
                     if k_orig.lower() in c_name.lower():
@@ -148,12 +161,12 @@ if f_a and f_b and f_c and f_d:
                     orig = get_col_exact(df_main, c_name)
                     if orig: df_final[col] = df_main[orig]
 
-            st.success("✅ 金额格式已修正，核算完成！")
-            st.dataframe(final_show := df_final.head(10))
+            st.success("✅ 核算完成！金额已按照千分位格式修复。")
+            st.dataframe(df_final.head(10))
 
             output = io.BytesIO()
             df_final.to_excel(output, index=False)
-            st.download_button("📥 下载 Shopee 核算结果", output.getvalue(), "Shopee_Corrected_A.xlsx")
+            st.download_button("📥 下载 Shopee 核算最终结果", output.getvalue(), "Shopee_Final_A_Fixed.xlsx")
 
         except Exception as e:
             st.error(f"❌ 运行报错: {str(e)}")
